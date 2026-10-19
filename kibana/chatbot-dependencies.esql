@@ -1,0 +1,47 @@
+-- Chatbot Dependencies dashboard panel — ES|QL data source
+--
+-- Paste this into the ES|QL editor when adding a custom visualization panel
+-- to a Kibana (Serverless Observability) dashboard. Pair with
+-- chatbot-dependencies-panel.html as the panel's render template.
+--
+-- What it computes, per (kind, dependency, mcp_server, llm_model):
+--   - kind: buckets each span into "LLM model provider", "Tools (via MCP)",
+--     "Tools (direct)", or "Other", based on whether it's an LLM call
+--     (peer.service containing "gemini"/"google"), an MCP-backed tool call
+--     (gen_ai.mcp.method.name present), or a local in-process tool.
+--   - mcp_server: the real MCP server's own name (service.name span attribute,
+--     learned via its MCP "initialize" handshake — see web_agent/server.py).
+--   - llm_model: the actual Gemini model used (gen_ai.request.model), since
+--     peer.service only carries the generic "google_gemini" provider label.
+--   - call_count / success_count / success_rate: per-group totals, driven by
+--     the standard APM/OTel-native event.outcome field.
+--   - in_tokens / out_tokens: summed from gen_ai.usage.input_tokens /
+--     gen_ai.usage.output_tokens span attributes, LLM rows only.
+
+FROM "traces-generic.otel-default"
+| WHERE @timestamp >= ?_tstart AND @timestamp < ?_tend
+| WHERE span.destination.service.resource IS NOT NULL
+| EVAL dep = span.destination.service.resource
+| EVAL dep_lc = TO_LOWER(dep)
+| EVAL is_tool = STARTS_WITH(dep_lc, "tool.")
+| EVAL is_mcp  = attributes.mcp.method.name IS NOT NULL
+| EVAL is_llm  = dep_lc LIKE "*gemini*" OR dep_lc LIKE "*google*"
+| EVAL kind = CASE(
+    is_llm, "LLM model provider",
+    is_tool AND is_mcp, "Tools (via MCP)",
+    is_tool, "Tools (direct)",
+    true, "Other"
+  )
+| EVAL mcp_server = CASE(is_mcp, COALESCE(attributes.service.name, "unknown"), "")
+| EVAL llm_model  = CASE(is_llm, COALESCE(attributes.gen_ai.request.model, "unknown"), "")
+| EVAL in_tok  = CASE(is_llm, COALESCE(attributes.gen_ai.usage.input_tokens, 0), 0)
+| EVAL out_tok = CASE(is_llm, COALESCE(attributes.gen_ai.usage.output_tokens, 0), 0)
+| EVAL is_success = CASE(event.outcome == "success", 1, 0)
+| STATS call_count    = COUNT(*),
+        success_count = SUM(is_success),
+        in_tokens      = SUM(in_tok),
+        out_tokens     = SUM(out_tok)
+      BY kind, dependency = dep, mcp_server, llm_model
+| EVAL success_rate = ROUND(100.0 * success_count / call_count, 1)
+| SORT kind ASC, call_count DESC
+| LIMIT 50

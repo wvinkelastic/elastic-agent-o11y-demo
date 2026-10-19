@@ -16,9 +16,10 @@ Demo features:
   ✅ 100% sampling (AlwaysOn) → every turn visible in APM
 """
 
-import os, sys, re, time, json, uuid, random, threading, socket, logging
+import os, sys, re, time, json, uuid, threading, socket, logging, itertools
 from datetime import datetime, timezone
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlsplit
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 try:
     import psutil
@@ -26,11 +27,12 @@ try:
 except ImportError:
     _PSUTIL = False
 
+import httpx
 from google import genai
 from google.genai import types
 
 # ── OpenTelemetry ──────────────────────────────────────────────────────────────
-from opentelemetry import trace, metrics
+from opentelemetry import trace, metrics, propagate
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.metrics import MeterProvider
@@ -51,11 +53,20 @@ GEMINI_KEY  = os.environ["GEMINI_API_KEY"]
 ES_ENDPOINT = os.environ["ES_ENDPOINT"]
 ES_API_KEY  = os.environ["ES_API_KEY"]
 
-MODEL_A   = os.environ.get("GEMINI_MODEL",   "gemini-2.5-flash")   # primary (70%)
-MODEL_B   = os.environ.get("GEMINI_MODEL_B", "gemini-2.5-flash-lite")  # cheaper variant (30%)
-AB_RATIO  = float(os.environ.get("AB_RATIO", "0.3"))               # fraction routed to B
+# Round-robin model pool — each new session gets the next model in order
+# (not random A/B weighting). Verified live against the Gemini API before use.
+MODEL_POOL = [m.strip() for m in os.environ.get(
+    "GEMINI_MODEL_POOL",
+    "gemini-3-flash-preview,gemini-3.1-flash-lite,gemini-3.5-flash,gemini-3.5-flash-lite",
+).split(",") if m.strip()]
+_rr_counter = itertools.count()  # protected by _lock at the one call site that uses it
 
-SVC_NAME  = "gemini-demo-agent"
+SVC_NAME  = os.environ.get("SVC_NAME", "gemini-demo-agent")
+
+# OTel GenAI semconv: registered gen_ai.provider.name value for the
+# Gemini Developer API (generativelanguage.googleapis.com), distinct from
+# "gcp.vertex_ai" (aiplatform.googleapis.com).
+GENAI_PROVIDER = "gcp.gemini"
 HOST_NAME = os.environ.get("HOST_NAME", socket.gethostname())
 PORT      = int(os.environ.get("PORT", "5601"))
 METRICS_INTERVAL_S = int(os.environ.get("METRICS_INTERVAL", "30"))
@@ -70,10 +81,29 @@ OTLP_HEADERS    = {"Authorization": f"ApiKey {ES_API_KEY}"}
 OTLP_ENDPOINT   = _INGEST   # display only
 KB_ENDPOINT     = ES_ENDPOINT.replace(".es.", ".kb.")
 
+# MCP server (mcp_server.py) — get_stock_price / get_company_news / get_analyst_rating
+# run there instead of in-process, reached over real MCP JSON-RPC (Streamable HTTP).
+MCP_SERVER_URL  = os.environ.get("MCP_SERVER_URL", "http://localhost:5603/mcp")
+MCP_TOOL_NAMES  = {"get_stock_price", "get_company_news", "get_analyst_rating"}
+MCP_PROTOCOL_VERSION = "2025-06-18"
+
+# Skills: packaged, local formatting/synthesis capabilities — distinct from tools
+# (which fetch or compute external data). Tagged with a "skill." peer.service
+# prefix (our own dashboard convention, same idea as "tool.<name>") rather than
+# "tool." so they group separately in APM dependency views.
+SKILL_TOOL_NAMES = {"format_investor_briefing"}
+_mcp_url_parts  = urlsplit(MCP_SERVER_URL)
+MCP_SERVER_ADDRESS = _mcp_url_parts.hostname
+MCP_SERVER_PORT     = _mcp_url_parts.port or (443 if _mcp_url_parts.scheme == "https" else 80)
+
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant. You have access to tools — use them when they "
     "would help you give a better, more accurate answer. Always search before answering "
-    "factual questions. Keep responses concise (under 300 words) and use markdown."
+    "factual questions. Keep responses concise (under 300 words) and use markdown. "
+    "When asked for a stock briefing, report, or summary covering more than one of "
+    "price/rating/news for a company, gather the relevant data first with "
+    "get_stock_price/get_analyst_rating/get_company_news, then call the "
+    "format_investor_briefing skill to produce the final formatted output before replying."
 )
 
 # ── OTel Resource ─────────────────────────────────────────────────────────────
@@ -111,33 +141,49 @@ meter_provider  = MeterProvider(resource=resource, metric_readers=[metric_reader
 metrics.set_meter_provider(meter_provider)
 meter = metrics.get_meter(SVC_NAME, "2.0.0")
 
-# gen_ai semantic convention instruments
-token_counter = meter.create_counter(
+# OTel GenAI semconv instruments — https://github.com/open-telemetry/semantic-conventions-genai
+# gen_ai.client.token.usage is specified as a Histogram, not a Counter.
+token_usage = meter.create_histogram(
     "gen_ai.client.token.usage", unit="{token}",
-    description="Tokens used by the generative AI model")
+    description="Number of input and output tokens used")
 op_duration = meter.create_histogram(
     "gen_ai.client.operation.duration", unit="s",
-    description="Duration of generative AI operations")
-error_counter = meter.create_counter(
-    "gen_ai.client.errors", unit="{error}",
-    description="Errors from the generative AI client")
+    description="GenAI operation duration")
 
-# Tool call instruments
-tool_calls_counter = meter.create_counter(
-    "gen_ai.tool.calls", unit="{call}",
-    description="Number of tool calls made by the agent")
+# gen_ai.execute_tool.duration is the spec's per-tool-call metric; the
+# implicit histogram count (faceted by gen_ai.tool.name) gives call volume,
+# so no separate "tool calls" counter is needed at this level.
 tool_duration = meter.create_histogram(
-    "gen_ai.tool.duration", unit="s",
-    description="Duration of individual tool executions")
+    "gen_ai.execute_tool.duration", unit="s",
+    description="The duration of a single tool execution")
+
+# mcp.client.operation.duration — OTel MCP semconv, recorded only for tool
+# calls actually dispatched to the mcp_server.py process over MCP.
+mcp_op_duration = meter.create_histogram(
+    "mcp.client.operation.duration", unit="s",
+    description="The duration of the MCP request as observed on the sender")
+
+# gen_ai.invoke_agent.tool_calls is the spec's agent-level metric: recorded
+# once per invoke_agent invocation with the total tool-call count for that turn.
+agent_tool_calls = meter.create_histogram(
+    "gen_ai.invoke_agent.tool_calls", unit="{tool_call}",
+    description="The number of tool calls a GenAI agent makes during a single invocation")
+
+# Not part of GenAI semconv (no registered error-count metric — error rate is
+# derived from error.type on gen_ai.client.operation.duration instead) or the
+# guardrail/feedback signals below, so these stay outside the gen_ai.* namespace.
+error_counter = meter.create_counter(
+    "client.errors", unit="{error}",
+    description="Errors from the generative AI client")
 
 # Guardrail instruments
 guardrail_counter = meter.create_counter(
-    "gen_ai.guardrail.violations", unit="{violation}",
+    "guardrail.violations", unit="{violation}",
     description="Guardrail violations detected (PII, policy, etc.)")
 
 # Feedback instruments
 feedback_counter = meter.create_counter(
-    "gen_ai.feedback", unit="{response}",
+    "feedback.responses", unit="{response}",
     description="User feedback on agent responses (positive/negative)")
 
 # System / process observable instruments (psutil callbacks)
@@ -175,7 +221,39 @@ logger.propagate = False
 
 # ── Gemini client ─────────────────────────────────────────────────────────────
 
-gemini = genai.Client(api_key=GEMINI_KEY)
+GEMINI_TIMEOUT_MS = int(os.environ.get("GEMINI_TIMEOUT_MS", "30000"))  # per-request, not per-turn
+gemini = genai.Client(
+    api_key=GEMINI_KEY,
+    http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+)
+
+# ── MCP client (mcp_server.py) ─────────────────────────────────────────────────
+
+mcp_http = httpx.Client(timeout=15)
+_mcp_request_id = itertools.count(1)
+MCP_SERVER_NAME = None  # learned via the "initialize" handshake — see _init_mcp_server()
+
+
+def _init_mcp_server():
+    """MCP 'initialize' handshake — learns the peer's own name (serverInfo.name)
+    so it can be attached to every MCP-backed execute_tool span, instead of
+    guessing it from server.address/port. Non-fatal: local tools still work
+    if the MCP server isn't up yet."""
+    global MCP_SERVER_NAME
+    try:
+        resp = mcp_http.post(MCP_SERVER_URL, json={
+            "jsonrpc": "2.0", "id": next(_mcp_request_id), "method": "initialize",
+            "params": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {},
+                       "clientInfo": {"name": SVC_NAME, "version": "2.0.0"}},
+        })
+        MCP_SERVER_NAME = resp.json()["result"]["serverInfo"]["name"]
+        logger.info(f"MCP server initialized: {MCP_SERVER_NAME} @ {MCP_SERVER_URL}")
+    except Exception as e:
+        logger.warning(f"MCP server initialize failed ({e}) — "
+                        f"MCP-backed tools will error until {MCP_SERVER_URL} is reachable")
+
+
+_init_mcp_server()
 
 # ── Gemini Tools (function declarations) ──────────────────────────────────────
 # Each tool call in the agentic loop becomes a child span in the APM waterfall.
@@ -217,7 +295,11 @@ GEMINI_TOOLS = types.Tool(function_declarations=[
     ),
     types.FunctionDeclaration(
         name="get_stock_price",
-        description="Look up the current or recent price and basic info for a stock ticker symbol.",
+        description=(
+            "Look up the current or recent price and basic info for a stock ticker symbol. "
+            "Returns a company_id needed by get_company_news and get_analyst_rating — "
+            "call this first if you need either of those."
+        ),
         parameters=types.Schema(
             type=types.Type.OBJECT,
             properties={
@@ -229,11 +311,81 @@ GEMINI_TOOLS = types.Tool(function_declarations=[
             required=["ticker"],
         ),
     ),
+    types.FunctionDeclaration(
+        name="get_company_news",
+        description=(
+            "Get recent news headlines for a company. Requires the company_id returned "
+            "by get_stock_price — you cannot call this with just a ticker symbol."
+        ),
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "company_id": types.Schema(
+                    type=types.Type.STRING,
+                    description="The company_id returned by a prior get_stock_price call, e.g. CID-AAPL-4471"
+                )
+            },
+            required=["company_id"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="get_analyst_rating",
+        description=(
+            "Get the current Wall Street analyst consensus rating (buy/hold/sell) and price "
+            "target for a company. Requires the company_id returned by get_stock_price — "
+            "you cannot call this with just a ticker symbol."
+        ),
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "company_id": types.Schema(
+                    type=types.Type.STRING,
+                    description="The company_id returned by a prior get_stock_price call, e.g. CID-AAPL-4471"
+                )
+            },
+            required=["company_id"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="format_investor_briefing",
+        description=(
+            "Skill (not a data-fetching tool): formats stock price, analyst rating, and "
+            "news information you have ALREADY gathered into a polished, structured investor "
+            "briefing. Call get_stock_price / get_analyst_rating / get_company_news first to "
+            "collect the raw information, then call this to produce the final formatted output "
+            "— this does not fetch or compute any new data itself, it only formats what you pass in."
+        ),
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "ticker": types.Schema(
+                    type=types.Type.STRING,
+                    description="Stock ticker symbol the briefing is about"
+                ),
+                "price_info": types.Schema(
+                    type=types.Type.STRING,
+                    description="Price/change info already gathered from get_stock_price"
+                ),
+                "rating_info": types.Schema(
+                    type=types.Type.STRING,
+                    description="Analyst rating info already gathered from get_analyst_rating"
+                ),
+                "news_info": types.Schema(
+                    type=types.Type.STRING,
+                    description="News headlines already gathered from get_company_news"
+                ),
+            },
+            required=["ticker"],
+        ),
+    ),
 ])
 
-
 def _execute_tool(name: str, args: dict) -> str:
-    """Execute a tool call and return its result string."""
+    """Execute a local, in-process tool call and return its result string.
+
+    get_stock_price / get_company_news / get_analyst_rating live in mcp_server.py
+    instead — see _call_mcp_tool below.
+    """
     if name == "search_knowledge_base":
         query = args.get("query", "")
         time.sleep(0.08)  # simulate network round-trip
@@ -254,22 +406,86 @@ def _execute_tool(name: str, args: dict) -> str:
         except Exception as e:
             return f"Calculation error: {e}"
 
-    elif name == "get_stock_price":
-        ticker = args.get("ticker", "").upper()
-        time.sleep(0.06)  # simulate API latency
-        # Simulated prices for common tickers
-        prices = {
-            "ESTC": 78.42, "GOOG": 182.15, "AAPL": 227.83,
-            "MSFT": 415.20, "AMZN": 196.47, "NVDA": 124.38,
-        }
-        price = prices.get(ticker, round(random.uniform(50, 500), 2))
-        change = round(random.uniform(-3.5, 4.2), 2)
-        pct    = round(change / price * 100, 2)
-        sign   = "+" if change >= 0 else ""
-        return (f"{ticker}: ${price:.2f}  {sign}{change} ({sign}{pct}%)  "
-                f"[simulated · {datetime.now(timezone.utc).strftime('%H:%M UTC')}]")
+    elif name == "format_investor_briefing":
+        ticker      = args.get("ticker", "").upper()
+        price_info  = args.get("price_info")  or "(no price data provided)"
+        rating_info = args.get("rating_info") or "(no rating data provided)"
+        news_info   = args.get("news_info")   or "(no news data provided)"
+        time.sleep(0.03)  # negligible — pure formatting, no I/O
+        return (
+            f"INVESTOR BRIEFING — {ticker}\n"
+            f"{'=' * 40}\n"
+            f"PRICE\n{price_info}\n\n"
+            f"ANALYST RATING\n{rating_info}\n\n"
+            f"RECENT NEWS\n{news_info}\n"
+            f"{'=' * 40}"
+        )
 
     return f"Unknown tool: {name}"
+
+
+def _safe_args_summary(args: dict, max_value_len: int = 40) -> str:
+    """JSON-encode tool call arguments for display, truncating each value —
+    never the serialized blob itself — so the result is always valid JSON
+    (the chat UI does JSON.parse() on this to render tool-call chips)."""
+    truncated = {
+        k: (v[:max_value_len] + "…" if isinstance(v, str) and len(v) > max_value_len else v)
+        for k, v in args.items()
+    }
+    return json.dumps(truncated)
+
+
+def _call_mcp_tool(name: str, args: dict) -> tuple[str, dict]:
+    """Call a tool served by mcp_server.py over real MCP JSON-RPC (Streamable HTTP).
+
+    Propagates the current trace context via the MCP request's params._meta
+    (NOT an HTTP header — MCP context propagation is transport-independent, per
+    https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/mcp.md),
+    so mcp_server.py's SERVER span becomes a child of our currently-open
+    execute_tool span, giving one continuous distributed trace.
+
+    Returns (result_text, meta) where meta carries the MCP-specific attributes
+    the caller sets on the (already open) execute_tool span.
+    """
+    if MCP_SERVER_NAME is None:
+        _init_mcp_server()  # e.g. mcp_server.py wasn't up yet at agent startup — retry once
+
+    meta = {}
+    propagate.inject(meta)
+
+    req_id = next(_mcp_request_id)
+    request = {
+        "jsonrpc": "2.0", "id": req_id, "method": "tools/call",
+        "params": {"name": name, "arguments": args, "_meta": meta},
+    }
+
+    result_meta = {
+        "jsonrpc.request.id": str(req_id),
+        "mcp.protocol.version": MCP_PROTOCOL_VERSION,
+        "network.protocol.name": "http",
+        "network.transport": "tcp",
+        "service.name": MCP_SERVER_NAME or f"unknown ({MCP_SERVER_URL})",
+    }
+
+    try:
+        response = mcp_http.post(MCP_SERVER_URL, json=request)
+        result_meta["network.protocol.version"] = response.http_version.replace("HTTP/", "")
+        body = response.json()
+    except Exception as e:
+        result_meta["error.type"] = type(e).__name__
+        return f"MCP transport error calling {name}: {e}", result_meta
+
+    if "error" in body:
+        err = body["error"]
+        result_meta["rpc.response.status_code"] = str(err.get("code", ""))
+        result_meta["error.type"] = str(err.get("code", ""))
+        return f"MCP error calling {name}: {err.get('message', 'unknown error')}", result_meta
+
+    content = body.get("result", {}).get("content", [])
+    text = content[0]["text"] if content and "text" in content[0] else json.dumps(body.get("result"))
+    if body.get("result", {}).get("isError"):
+        result_meta["error.type"] = "tool_error"
+    return text, result_meta
 
 
 # ── PII detection ─────────────────────────────────────────────────────────────
@@ -318,17 +534,18 @@ def _psutil_scrape_loop():
 def chat_turn(user_message: str, conversation_id: str, history: list,
               model: str, variant: str) -> dict:
     """
-    Full agentic turn with OTel instrumentation:
+    Full agentic turn with OTel instrumentation (OTel GenAI semconv):
 
-      invoke_agent [SERVER]              ← root span / APM transaction
-        ├── tool:search_knowledge_base [CLIENT]  ← tool call spans
-        ├── tool:calculate [CLIENT]
-        └── chat {MODEL} [CLIENT]        ← LLM call span
+      invoke_agent {SVC_NAME} [INTERNAL]                ← root span / APM transaction
+        ├── execute_tool search_knowledge_base [INTERNAL]  ← tool call spans
+        ├── execute_tool calculate [INTERNAL]
+        └── generate_content {MODEL} [CLIENT]           ← LLM inference span
 
     Also emits:
       - PII guardrail check (span event + metric if triggered)
-      - gen_ai.content.prompt/completion span events
-      - token_counter, op_duration, tool_calls_counter metrics
+      - gen_ai.input.messages / gen_ai.output.messages span attributes
+      - gen_ai.client.token.usage, gen_ai.client.operation.duration,
+        gen_ai.execute_tool.duration, gen_ai.invoke_agent.tool_calls metrics
       - Structured logs correlated to trace_id
     """
     t0 = time.time()
@@ -336,14 +553,13 @@ def chat_turn(user_message: str, conversation_id: str, history: list,
     tool_calls_made = []   # [{name, args_summary, result_summary, duration_ms}]
 
     with tracer.start_as_current_span(
-        "invoke_agent",
-        kind=SpanKind.SERVER,
+        f"invoke_agent {SVC_NAME}",
+        kind=SpanKind.INTERNAL,
         attributes={
             "gen_ai.operation.name":   "invoke_agent",
-            "gen_ai.system":           "google_gemini",
+            "gen_ai.agent.name":       SVC_NAME,
             "gen_ai.request.model":    model,
             "gen_ai.conversation.id":  conversation_id,
-            "gen_ai.agent.name":       SVC_NAME,
             "ab.variant":              variant,
             "ab.model":                model,
         },
@@ -362,9 +578,9 @@ def chat_turn(user_message: str, conversation_id: str, history: list,
             root.set_attribute("guardrail.pii_detected", True)
             for pii_type in pii_types:
                 guardrail_counter.add(1, {
-                    "guardrail.type":   "pii",
-                    "pii.type":         pii_type,
-                    "gen_ai.system":    "google_gemini",
+                    "guardrail.type":       "pii",
+                    "pii.type":             pii_type,
+                    "gen_ai.provider.name": GENAI_PROVIDER,
                 })
             logger.warning("PII detected in user message",
                            extra={"pii_types": pii_types, "conversation_id": conversation_id})
@@ -379,16 +595,16 @@ def chat_turn(user_message: str, conversation_id: str, history: list,
         # ── Agentic LLM loop with tool calls ───────────────────────────
         in_tok = out_tok = 0
         is_error = False
+        error_type = None
         output_text = ""
 
         with tracer.start_as_current_span(
-            f"chat {model}",
+            f"generate_content {model}",
             kind=SpanKind.CLIENT,
             attributes={
-                "gen_ai.operation.name":  "chat",
-                "gen_ai.system":          "google_gemini",
+                "gen_ai.operation.name":  "generate_content",
+                "gen_ai.provider.name":   GENAI_PROVIDER,
                 "gen_ai.request.model":   model,
-                "gen_ai.input.messages":  user_message[:800],
                 "peer.service":           "google_gemini",
                 "server.address":         "generativelanguage.googleapis.com",
                 "server.port":            443,
@@ -400,6 +616,19 @@ def chat_turn(user_message: str, conversation_id: str, history: list,
             },
         ) as llm:
             try:
+                # gen_ai.input.messages / gen_ai.system_instructions — structured
+                # per https://github.com/open-telemetry/semantic-conventions-genai
+                # model/gen-ai/gen-ai-input-messages.json (recorded as a JSON
+                # string on spans, per the "Recording content on attributes" note).
+                input_messages = [
+                    {"role": "assistant" if t["role"] == "model" else t["role"],
+                     "parts": [{"type": "text", "content": t["text"]}]}
+                    for t in history
+                ] + [{"role": "user", "parts": [{"type": "text", "content": user_message}]}]
+                llm.set_attribute("gen_ai.input.messages", json.dumps(input_messages)[:4000])
+                llm.set_attribute("gen_ai.system_instructions",
+                                   json.dumps([{"type": "text", "content": SYSTEM_PROMPT}]))
+
                 # Build conversation contents
                 contents = [
                     types.Content(role=t["role"], parts=[types.Part(text=t["text"])])
@@ -438,37 +667,90 @@ def chat_turn(user_message: str, conversation_id: str, history: list,
                     for fc in fn_calls:
                         tool_name = fc.name
                         tool_args = dict(fc.args) if fc.args else {}
+                        is_mcp_tool = tool_name in MCP_TOOL_NAMES
+                        is_skill = tool_name in SKILL_TOOL_NAMES
                         t_tool = time.time()
 
+                        # Dependency-name prefix drives dashboard bucketing: "skill."
+                        # for packaged formatting/synthesis skills, "tool." for
+                        # everything else (data-fetching functions, local or MCP).
+                        _dep_prefix = "skill" if is_skill else "tool"
+
                         with tracer.start_as_current_span(
-                            f"tool:{tool_name}",
-                            kind=SpanKind.CLIENT,
+                            f"execute_tool {tool_name}",
+                            # A genuine network hop to mcp_server.py is CLIENT kind;
+                            # in-process tools/skills stay INTERNAL, per the execute_tool span spec.
+                            kind=SpanKind.CLIENT if is_mcp_tool else SpanKind.INTERNAL,
                             attributes={
+                                "gen_ai.operation.name":  "execute_tool",
                                 "gen_ai.tool.name":       tool_name,
                                 "gen_ai.tool.call.id":    f"{tool_name}_{_iteration}",
-                                "gen_ai.operation.name":  "tool",
-                                "gen_ai.system":          "google_gemini",
-                                "peer.service":           f"tool.{tool_name}",
-                                "tool.arguments":         json.dumps(tool_args)[:400],
+                                "gen_ai.tool.type":       "function",
+                                "gen_ai.agent.name":      SVC_NAME,
+                                "gen_ai.conversation.id": conversation_id,
+                                "gen_ai.tool.call.arguments": json.dumps(tool_args)[:400],
+                                "peer.service":           f"{_dep_prefix}.{tool_name}",
                             },
                         ) as tool_span:
-                            result = _execute_tool(tool_name, tool_args)
+                            mcp_meta = None
+                            if is_mcp_tool:
+                                result, mcp_meta = _call_mcp_tool(tool_name, tool_args)
+                            else:
+                                result = _execute_tool(tool_name, tool_args)
                             tool_dur = time.time() - t_tool
 
+                            tool_span.set_attribute("gen_ai.tool.call.result", result[:400])
                             tool_span.set_attribute("tool.result_length", len(result))
-                            tool_span.set_attribute("tool.duration_ms", round(tool_dur * 1000))
-                            tool_span.set_status(StatusCode.OK)
 
-                            # Metrics
-                            tool_calls_counter.add(1, {
-                                "gen_ai.tool.name": tool_name,
-                                "gen_ai.system":    "google_gemini",
+                            if mcp_meta is not None:
+                                # MCP semconv: add MCP-specific attributes to the existing
+                                # tool execution span rather than nesting a separate one.
+                                tool_span.set_attribute("mcp.method.name", "tools/call")
+                                tool_span.set_attribute("mcp.protocol.version", mcp_meta["mcp.protocol.version"])
+                                tool_span.set_attribute("jsonrpc.request.id", mcp_meta["jsonrpc.request.id"])
+                                tool_span.set_attribute("network.protocol.name", mcp_meta["network.protocol.name"])
+                                tool_span.set_attribute("network.transport", mcp_meta["network.transport"])
+                                if "network.protocol.version" in mcp_meta:
+                                    tool_span.set_attribute("network.protocol.version", mcp_meta["network.protocol.version"])
+                                tool_span.set_attribute("server.address", MCP_SERVER_ADDRESS)
+                                tool_span.set_attribute("server.port", MCP_SERVER_PORT)
+                                # service.name is normally a resource attribute; setting it on
+                                # the span records the peer's identity (learned via its own
+                                # "initialize" serverInfo.name) without inventing a new,
+                                # unregistered mcp.* attribute. Lands as attributes.service.name
+                                # in Elastic — distinct from the top-level service.name field,
+                                # which stays "gemini-demo-agent" (this process's own resource).
+                                tool_span.set_attribute("service.name", mcp_meta["service.name"])
+
+                                mcp_metric_attrs = {
+                                    "mcp.method.name":       "tools/call",
+                                    "gen_ai.operation.name": "execute_tool",
+                                    "gen_ai.tool.name":      tool_name,
+                                    "network.transport":     mcp_meta["network.transport"],
+                                }
+                                if "error.type" in mcp_meta:
+                                    tool_span.set_attribute("error.type", mcp_meta["error.type"])
+                                    mcp_metric_attrs["error.type"] = mcp_meta["error.type"]
+                                    if "rpc.response.status_code" in mcp_meta:
+                                        tool_span.set_attribute("rpc.response.status_code", mcp_meta["rpc.response.status_code"])
+                                        mcp_metric_attrs["rpc.response.status_code"] = mcp_meta["rpc.response.status_code"]
+                                    tool_span.set_status(StatusCode.ERROR, result[:200])
+                                else:
+                                    tool_span.set_status(StatusCode.OK)
+                                mcp_op_duration.record(tool_dur, mcp_metric_attrs)
+                            else:
+                                tool_span.set_status(StatusCode.OK)
+
+                            # gen_ai.execute_tool.duration — matches the span duration,
+                            # per the metric's spec note.
+                            tool_duration.record(tool_dur, {
+                                "gen_ai.tool.name":  tool_name,
+                                "gen_ai.agent.name": SVC_NAME,
                             })
-                            tool_duration.record(tool_dur, {"gen_ai.tool.name": tool_name})
 
                             tool_calls_made.append({
                                 "name":           tool_name,
-                                "args_summary":   json.dumps(tool_args)[:120],
+                                "args_summary":   _safe_args_summary(tool_args),
                                 "result_summary": result[:120],
                                 "duration_ms":    round(tool_dur * 1000),
                             })
@@ -483,27 +765,28 @@ def chat_turn(user_message: str, conversation_id: str, history: list,
                     contents.append(response.candidates[0].content)
                     contents.append(types.Content(role="user", parts=fn_response_parts))
 
-                # Span events — full prompt + completion text
-                llm.add_event("gen_ai.content.prompt", {"gen_ai.prompt": user_message})
-                llm.add_event("gen_ai.content.completion", {"gen_ai.completion": output_text})
+                # gen_ai.output.messages — structured, per the output messages schema
+                output_messages = [{"role": "assistant",
+                                     "parts": [{"type": "text", "content": output_text}]}]
+                llm.set_attribute("gen_ai.output.messages", json.dumps(output_messages)[:4000])
 
                 llm.set_attribute("gen_ai.response.model",      model)
                 llm.set_attribute("gen_ai.usage.input_tokens",  in_tok)
                 llm.set_attribute("gen_ai.usage.output_tokens", out_tok)
-                llm.set_attribute("gen_ai.output.messages",     output_text[:800])
-                llm.set_attribute("gen_ai.tool.calls_count",    len(tool_calls_made))
+                llm.set_attribute("tool.calls_count",           len(tool_calls_made))
                 llm.set_status(StatusCode.OK)
 
                 root.set_attribute("gen_ai.usage.input_tokens",  in_tok)
                 root.set_attribute("gen_ai.usage.output_tokens", out_tok)
-                root.set_attribute("gen_ai.tool.calls_count",    len(tool_calls_made))
+                root.set_attribute("tool.calls_count",           len(tool_calls_made))
                 root.set_status(StatusCode.OK)
 
-                # Token metrics
-                attrs = {"gen_ai.operation.name": "chat", "gen_ai.system": "google_gemini",
+                # gen_ai.client.token.usage — Histogram per spec
+                attrs = {"gen_ai.operation.name": "generate_content",
+                         "gen_ai.provider.name": GENAI_PROVIDER,
                          "gen_ai.request.model": model, "ab.variant": variant}
-                token_counter.add(in_tok,  {**attrs, "gen_ai.token.type": "input"})
-                token_counter.add(out_tok, {**attrs, "gen_ai.token.type": "output"})
+                token_usage.record(in_tok,  {**attrs, "gen_ai.token.type": "input"})
+                token_usage.record(out_tok, {**attrs, "gen_ai.token.type": "output"})
 
             except Exception as e:
                 llm.set_status(StatusCode.ERROR, str(e))
@@ -511,23 +794,28 @@ def chat_turn(user_message: str, conversation_id: str, history: list,
                 root.set_status(StatusCode.ERROR, str(e))
                 logger.error(f"Gemini API error: {e}", exc_info=True,
                              extra={"model": model, "conversation_id": conversation_id})
-                error_counter.add(1, {"gen_ai.operation.name": "chat",
-                                      "gen_ai.system": "google_gemini",
-                                      "error.type": type(e).__name__,
+                error_type = type(e).__name__
+                error_counter.add(1, {"gen_ai.operation.name": "generate_content",
+                                      "gen_ai.provider.name": GENAI_PROVIDER,
+                                      "error.type": error_type,
                                       "ab.variant": variant})
                 output_text = f"Sorry, I encountered an error: {e}"
                 is_error = True
+
+            # gen_ai.invoke_agent.tool_calls — Histogram, recorded once per
+            # agent invocation with the total tool-call count for this turn.
+            agent_tool_calls.record(len(tool_calls_made), {"gen_ai.agent.name": SVC_NAME})
 
     elapsed_s  = time.time() - t0
     cost_usd   = (in_tok * 0.075 + out_tok * 0.30) / 1_000_000
 
     op_duration.record(elapsed_s, {
-        "gen_ai.operation.name":  "chat",
-        "gen_ai.system":          "google_gemini",
+        "gen_ai.operation.name":  "generate_content",
+        "gen_ai.provider.name":   GENAI_PROVIDER,
         "gen_ai.request.model":   model,
         "gen_ai.response.model":  model,
         "ab.variant":             variant,
-        "error.occurred":         is_error,
+        **({"error.type": error_type} if is_error else {}),
     })
 
     logger.info("Turn completed", extra={
@@ -555,7 +843,7 @@ def chat_turn(user_message: str, conversation_id: str, history: list,
         "pii_detected": bool(pii_types),
         "transport":   "otlp",
         "apm_url":     (f"{KB_ENDPOINT}/app/apm/services/{SVC_NAME}/transactions/view"
-                        f"?transactionName=invoke_agent&transactionType=request"),
+                        f"?transactionName=invoke_agent%20{SVC_NAME}&transactionType=unknown"),
     }
 
 
@@ -568,9 +856,11 @@ def get_or_create_session(session_id=None):
     with _lock:
         if not session_id or session_id not in _sessions:
             session_id = uuid.uuid4().hex[:12]
-            # Assign A/B variant at session creation — consistent within a session
-            variant = "B" if random.random() < AB_RATIO else "A"
-            model   = MODEL_B if variant == "B" else MODEL_A
+            # Round-robin across MODEL_POOL — assigned once at session creation,
+            # consistent within a session, cycling in order rather than randomly.
+            idx     = next(_rr_counter) % len(MODEL_POOL)
+            model   = MODEL_POOL[idx]
+            variant = chr(ord("A") + (idx % 26))
             _sessions[session_id] = {
                 "id":      session_id,
                 "conv_id": uuid.uuid4().hex[:8],
@@ -609,6 +899,10 @@ HTML = r"""<!DOCTYPE html>
   .badge.live{border-color:var(--elastic);color:var(--elastic)}
   .badge.ab-a{border-color:var(--blue);color:var(--blue)}
   .badge.ab-b{border-color:var(--tool);color:var(--tool)}
+  .badge.ab-c{border-color:var(--green);color:var(--green)}
+  .badge.ab-d{border-color:var(--yellow);color:var(--yellow)}
+  .badge.ab-e{border-color:var(--red);color:var(--red)}
+  .badge.ab-f{border-color:var(--otel);color:var(--otel)}
   .apm-btn{color:var(--blue);text-decoration:none;font-size:12px;border:1px solid var(--border);border-radius:4px;padding:3px 10px;transition:border-color .15s}
   .apm-btn:hover{border-color:var(--blue)}
 
@@ -651,6 +945,10 @@ HTML = r"""<!DOCTYPE html>
   .pill.pii{border-color:var(--red);color:var(--red)}
   .pill.ab-a{border-color:var(--blue);color:var(--blue)}
   .pill.ab-b{border-color:var(--tool);color:var(--tool)}
+  .pill.ab-c{border-color:var(--green);color:var(--green)}
+  .pill.ab-d{border-color:var(--yellow);color:var(--yellow)}
+  .pill.ab-e{border-color:var(--red);color:var(--red)}
+  .pill.ab-f{border-color:var(--otel);color:var(--otel)}
 
   /* Feedback buttons */
   .feedback-row{display:flex;gap:8px;align-items:center;margin-left:40px;margin-top:2px}
@@ -691,6 +989,20 @@ HTML = r"""<!DOCTYPE html>
   .dot-s.ok{background:var(--green)}.dot-s.dim{background:var(--text-3)}
   .dot-s.tool{background:var(--tool)}
   .sig-txt{color:var(--text-2)}.sig-sub{color:var(--text-3);font-size:10px}
+
+  /* Demo scenario prompt cards */
+  .scenario-list{display:flex;flex-direction:column;gap:6px}
+  .scenario-card{border:1px solid var(--border);border-radius:8px;padding:8px 10px;cursor:pointer;background:var(--bg);transition:border-color .15s,background .15s}
+  .scenario-card:hover{border-color:var(--elastic);background:var(--elastic-2)}
+  .scenario-card:active{opacity:.7}
+  .scenario-top{display:flex;align-items:center;gap:6px;margin-bottom:3px}
+  .scenario-title{font-size:12px;font-weight:600;color:var(--text)}
+  .scenario-desc{font-size:10.5px;color:var(--text-3);line-height:1.4}
+  .scenario-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+  .scenario-dot.tool{background:var(--tool)}
+  .scenario-dot.mcp{background:var(--blue)}
+  .scenario-dot.skill{background:var(--green)}
+  .scenario-dot.pii{background:var(--red)}
 
   .welcome{text-align:center;padding:50px 30px;color:var(--text-2)}
   .welcome h2{color:var(--text);font-size:20px;margin-bottom:8px}
@@ -740,6 +1052,38 @@ HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="tele">
+    <div class="tele-hdr">Demo Scenarios</div>
+
+    <div class="tele-sec">
+      <div class="tele-lbl">Click a prompt to run it</div>
+      <div class="scenario-list">
+        <div class="scenario-card" data-cat="tool" data-prompt="What are the best practices for Kubernetes autoscaling?">
+          <div class="scenario-top"><span class="scenario-dot tool"></span><span class="scenario-title">Local tool — search</span></div>
+          <div class="scenario-desc">In-process search_knowledge_base — no network hop, INTERNAL span.</div>
+        </div>
+        <div class="scenario-card" data-cat="tool" data-prompt="Calculate 20% of 350, and search for info on OpenTelemetry trace context propagation.">
+          <div class="scenario-top"><span class="scenario-dot tool"></span><span class="scenario-title">Local tools — combo</span></div>
+          <div class="scenario-desc">calculate + search_knowledge_base in one turn, both local.</div>
+        </div>
+        <div class="scenario-card" data-cat="mcp" data-prompt="What's the current stock price of AAPL?">
+          <div class="scenario-top"><span class="scenario-dot mcp"></span><span class="scenario-title">MCP tool — single call</span></div>
+          <div class="scenario-desc">get_stock_price served by the separate MCP server — real network hop (CLIENT→SERVER spans).</div>
+        </div>
+        <div class="scenario-card" data-cat="mcp" data-prompt="What's the analyst rating and recent news for MSFT?">
+          <div class="scenario-top"><span class="scenario-dot mcp"></span><span class="scenario-title">MCP tool chain</span></div>
+          <div class="scenario-desc">get_stock_price → get_analyst_rating + get_company_news — 3 chained MCP calls, one dependency (company_id).</div>
+        </div>
+        <div class="scenario-card" data-cat="skill" data-prompt="Give me a full investor briefing for MSFT including price, analyst rating, and recent news.">
+          <div class="scenario-top"><span class="scenario-dot skill"></span><span class="scenario-title">Skill — investor briefing</span></div>
+          <div class="scenario-desc">Gathers data via MCP, then invokes the format_investor_briefing skill to synthesize the final report.</div>
+        </div>
+        <div class="scenario-card" data-cat="pii" data-prompt="My email is john.doe@example.com — can you help me troubleshoot why I can't log in?">
+          <div class="scenario-top"><span class="scenario-dot pii"></span><span class="scenario-title">PII guardrail</span></div>
+          <div class="scenario-desc">Message contains an email address — triggers the PII detector span event + metric.</div>
+        </div>
+      </div>
+    </div>
+
     <div class="tele-hdr">Live OTel Telemetry</div>
 
     <div class="tele-sec">
@@ -752,11 +1096,10 @@ HTML = r"""<!DOCTYPE html>
     </div>
 
     <div class="tele-sec">
-      <div class="tele-lbl">A/B Routing</div>
+      <div class="tele-lbl">Round-Robin Models</div>
       <div class="kv"><span>This session</span><span class="b" id="t-variant">—</span></div>
       <div class="kv"><span>Model</span><span class="e" id="t-model-used">—</span></div>
-      <div class="kv"><span>A = primary</span><span class="b" id="cfg-ma">—</span></div>
-      <div class="kv"><span>B = lighter</span><span class="t" id="cfg-mb">—</span></div>
+      <div id="model-pool-list"></div>
     </div>
 
     <div class="tele-sec">
@@ -810,11 +1153,21 @@ HTML = r"""<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let sid=null, turns=0, totIn=0, totOut=0, totCost=0, totTools=0, totUp=0, totDown=0, cfg={};
 
+const AB_CLASSES = ['ab-a','ab-b','ab-c','ab-d','ab-e','ab-f'];
+function abClassFor(variant){
+  const idx = (variant||'A').charCodeAt(0) - 65;
+  return AB_CLASSES[((idx % AB_CLASSES.length) + AB_CLASSES.length) % AB_CLASSES.length];
+}
+
 fetch('/api/config').then(r=>r.json()).then(c=>{
   cfg = c;
-  $('hdr-model').textContent = c.model_a;
-  $('cfg-ma').textContent = c.model_a;
-  $('cfg-mb').textContent = c.model_b;
+  $('hdr-model').textContent = c.models.length + ' models (round-robin)';
+  const KV_CLASSES = ['b','t','g','y','e','r'];
+  $('model-pool-list').innerHTML = c.models.map((m,i)=>{
+    const letter = String.fromCharCode(65+i);
+    const cls = KV_CLASSES[i % KV_CLASSES.length];
+    return `<div class="kv"><span>${letter}</span><span class="${cls}">${m}</span></div>`;
+  }).join('');
   $('apm-link').href = c.apm_url;
   $('psutil-dot').className = 'dot-s ' + (c.psutil ? 'ok' : 'dim');
 });
@@ -822,6 +1175,15 @@ fetch('/api/config').then(r=>r.json()).then(c=>{
 const ta = $('inp');
 ta.addEventListener('input', ()=>{ ta.style.height='42px'; ta.style.height=Math.min(ta.scrollHeight,120)+'px'; });
 ta.addEventListener('keydown', e=>{ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();} });
+
+document.querySelectorAll('.scenario-card').forEach(card=>{
+  card.onclick = ()=>{
+    if($('send-btn').disabled) return; // a turn is already in flight
+    ta.value = card.dataset.prompt;
+    ta.dispatchEvent(new Event('input'));
+    send();
+  };
+});
 
 $('new-btn').onclick = ()=>{
   sid=null; turns=totIn=totOut=totCost=totTools=totUp=totDown=0; statUpdate();
@@ -878,7 +1240,10 @@ function addToolChips(tools){
   const wrap=document.createElement('div'); wrap.className='tools-row';
   tools.forEach((t,i)=>{
     const chip=document.createElement('div'); chip.className='tool-chip';
-    chip.innerHTML=`<span>🔧</span><span class="tc-name">${t.name}(${JSON.stringify(JSON.parse(t.args_summary||'{}')).slice(0,40)})</span><span class="tc-dur">${t.duration_ms}ms</span>`;
+    let argsPreview;
+    try{ argsPreview=JSON.stringify(JSON.parse(t.args_summary||'{}')).slice(0,40); }
+    catch(e){ argsPreview=(t.args_summary||'').slice(0,40); }
+    chip.innerHTML=`<span>🔧</span><span class="tc-name">${t.name}(${argsPreview})</span><span class="tc-dur">${t.duration_ms}ms</span>`;
     const detail=document.createElement('div'); detail.className='tool-detail';
     detail.textContent=`→ ${t.result_summary}`;
     chip.onclick=()=>detail.classList.toggle('open');
@@ -889,7 +1254,7 @@ function addToolChips(tools){
 
 function addPills(d){
   const r=document.createElement('div'); r.className='pills-row';
-  const abClass=d.variant==='B'?'ab-b':'ab-a';
+  const abClass=abClassFor(d.variant||'A');
   r.innerHTML=`
     <a class="pill trace" href="${cfg.apm_url||'#'}" target="_blank">📡 ${(d.trace_id||'').substring(0,8)}…</a>
     <span class="pill otlp">OTLP</span>
@@ -932,8 +1297,8 @@ function scroll(){ const m=$('msgs'); m.scrollTop=m.scrollHeight; }
 function updateAB(d){
   $('t-variant').textContent = d.variant||'A';
   $('t-model-used').textContent = d.model_used||'—';
-  const abClass=d.variant==='B'?'ab-b':'ab-a';
-  $('hdr-ab').textContent=(d.variant==='B'?'B:lighter':'A:primary');
+  const abClass=abClassFor(d.variant||'A');
+  $('hdr-ab').textContent=(d.variant||'A')+': '+(d.model_used||'—');
   $('hdr-ab').className='badge '+abClass;
 }
 
@@ -976,9 +1341,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/api/config":
             return self.send_json(200, {
-                "model_a":          MODEL_A,
-                "model_b":          MODEL_B,
-                "ab_ratio":         AB_RATIO,
+                "models":           MODEL_POOL,
                 "host":             HOST_NAME,
                 "metrics_interval": METRICS_INTERVAL_S,
                 "psutil":           _PSUTIL,
@@ -1023,8 +1386,8 @@ class Handler(BaseHTTPRequestHandler):
 
             label = "positive" if rating > 0 else "negative"
             feedback_counter.add(1, {
-                "feedback.rating": label,
-                "gen_ai.system":   "google_gemini",
+                "feedback.rating":      label,
+                "gen_ai.provider.name": GENAI_PROVIDER,
             })
             logger.info("User feedback received", extra={
                 "feedback.rating":     label,
@@ -1045,8 +1408,8 @@ def main():
         psutil.cpu_percent(interval=None)
         threading.Thread(target=_psutil_scrape_loop, daemon=True, name="psutil-scrape").start()
 
-    logger.info(f"Web agent v2 starting — model_a={MODEL_A} model_b={MODEL_B} "
-                f"ab_ratio={AB_RATIO} host={HOST_NAME} port={PORT} psutil={_PSUTIL}")
+    logger.info(f"Web agent v2 starting — model_pool={MODEL_POOL} "
+                f"host={HOST_NAME} port={PORT} psutil={_PSUTIL}")
 
     print(f"\n{'─'*64}")
     print(f"  Elastic AI Agent — Full OTel Demo  v2.0")
@@ -1054,8 +1417,9 @@ def main():
     print(f"  Chat UI  →  http://localhost:{PORT}")
     print(f"  APM UI   →  {KB_ENDPOINT}/app/apm/services/{SVC_NAME}/overview")
     print(f"  Host     :  {HOST_NAME}")
-    print(f"  Model A  :  {MODEL_A}  (primary, {round((1-AB_RATIO)*100)}%)")
-    print(f"  Model B  :  {MODEL_B}  (lighter, {round(AB_RATIO*100)}%)")
+    print(f"  Models   :  round-robin across {len(MODEL_POOL)}")
+    for i, m in enumerate(MODEL_POOL):
+        print(f"    {chr(ord('A') + i)}: {m}")
     print(f"{'─'*64}")
     print(f"  OTel signals → {OTLP_ENDPOINT}")
     print(f"    📡 Traces  (+ tool spans)  → traces-generic.otel-default")
@@ -1065,7 +1429,7 @@ def main():
     print(f"  Features: tool calling · A/B routing · PII guardrails · feedback loop")
     print(f"{'─'*64}\n")
 
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

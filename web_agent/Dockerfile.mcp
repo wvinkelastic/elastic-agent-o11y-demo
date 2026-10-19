@@ -1,0 +1,21 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install dependencies — no google-genai/httpx/psutil needed, this process only
+# receives MCP JSON-RPC over HTTP and exports OTel signals.
+RUN pip install --no-cache-dir \
+    opentelemetry-sdk \
+    opentelemetry-exporter-otlp-proto-http
+
+# Copy the server
+COPY mcp_server.py .
+
+# Expose MCP endpoint port
+EXPOSE 5603
+
+# Health check
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s \
+  CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:5603/health')" || exit 1
+
+CMD ["python3", "mcp_server.py"]

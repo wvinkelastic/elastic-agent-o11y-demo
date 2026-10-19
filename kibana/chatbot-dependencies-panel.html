@@ -1,0 +1,663 @@
+<!--
+  Chatbot Dependencies dashboard panel — render template.
+
+  Pair with chatbot-dependencies.esql as the panel's ES|QL data source.
+  Add as a "custom visualization" panel on a Kibana (Serverless Observability)
+  dashboard — see ../kibana/README.md for exact setup steps.
+
+  Visualizes three signal groups from the agent's traces:
+    - LLM Provider: which Gemini model actually ran, call count, token usage,
+      success rate
+    - Tools (via MCP): tool calls served by the separate mcp_server.py
+      process, grouped by the real MCP server name
+    - Tools (direct): tool calls that ran in-process in the agent itself
+
+  Collapsible sections use a pure-CSS checkbox+label accordion (no
+  JavaScript) — this Kibana panel type strips <script> and <details> tags,
+  so this is the one interactive pattern confirmed to survive its sanitizer.
+-->
+<style>
+  body {
+    margin: 0;
+    padding: var(--cc-space-l);
+    box-sizing: border-box;
+    font-family: var(--cc-font-family);
+    color: var(--cc-color-text);
+    background: var(--cc-color-background);
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+
+  .wrap { display: flex; flex-direction: column; gap: var(--cc-space-m); width: 100%; }
+
+  .pg-hdr { display: flex; flex-direction: column; gap: 4px; }
+  .pg-hdr h2 { margin: 0; font-size: .875rem; font-weight: 600; }
+  .pg-hdr p  { margin: 0; font-size: .75rem; opacity: .65; line-height: 1.4; }
+
+  .empty {
+    background: var(--cc-color-surface);
+    border: 1px solid var(--cc-color-border);
+    border-radius: var(--cc-radius);
+    padding: var(--cc-space-l);
+    text-align: center;
+    font-size: .875rem;
+    opacity: .7;
+  }
+
+  .diag { display: flex; align-items: flex-start; gap: 0; }
+
+  .chatbot-card {
+    flex-shrink: 0;
+    width: 200px;
+    background: var(--cc-color-surface);
+    border: 1px solid var(--cc-color-border);
+    border-radius: var(--cc-radius);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .chatbot-icon {
+    width: 42px; height: 42px;
+    background: var(--cc-color-background);
+    border: 1px solid var(--cc-color-border);
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .chatbot-name { font-size: .8125rem; font-weight: 600; word-break: break-word; line-height: 1.3; }
+  .chatbot-chip {
+    display: inline-flex; align-items: center;
+    padding: 2px 10px; border-radius: 999px;
+    font-size: .6875rem;
+    background: var(--cc-color-background);
+    border: 1px solid var(--cc-color-border);
+    opacity: .85; width: fit-content;
+  }
+  .chatbot-stat { font-size: .6875rem; opacity: .5; line-height: 1.3; }
+
+  .arrow-conn { flex-shrink: 0; width: 52px; display: flex; align-items: center; padding-top: 30px; }
+  .arrow-line  { width: 100%; height: 2px; background: var(--cc-color-border); position: relative; }
+  .arrow-line::after {
+    content: '';
+    position: absolute; right: -1px; top: -5px;
+    width: 0; height: 0;
+    border-left: 8px solid var(--cc-color-border);
+    border-top: 6px solid transparent;
+    border-bottom: 6px solid transparent;
+  }
+
+  .deps-panel { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: var(--cc-space-s); }
+
+  /* ── Accordion panel (checkbox + label + max-height body) ── */
+  .panel {
+    background: var(--cc-color-surface);
+    border: 1px solid var(--cc-color-border);
+    border-radius: var(--cc-radius);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    overflow: hidden;
+  }
+  .acc-toggle { display: none; }
+
+  .panel-heading {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 16px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .sec-dot  { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .dot-llm  { background: var(--cc-vis-7); }
+  .dot-tool-mcp { background: var(--cc-vis-8); }
+  .dot-tool-direct { background: var(--cc-vis-0); }
+  .dot-skill{ background: var(--cc-vis-3); }
+  .dot-other{ background: var(--cc-color-border); }
+  .sec-label{
+    font-size: .6875rem; font-weight: 600;
+    letter-spacing: .05em; text-transform: uppercase; opacity: .65;
+  }
+  .sec-meta {
+    margin-left: auto;
+    font-size: .6875rem; font-weight: 400;
+    text-transform: none; letter-spacing: 0;
+    opacity: .75;
+    white-space: nowrap;
+  }
+  .sec-meta-empty { opacity: .5; font-style: italic; }
+
+  .chevron {
+    font-size: .625rem; opacity: .55;
+    transition: transform var(--cc-motion-normal) var(--cc-ease);
+    transform: rotate(0deg);
+    flex-shrink: 0;
+  }
+  .acc-toggle:checked ~ .panel-heading .chevron,
+  .acc-toggle:checked ~ .mcp-group-heading .chevron { transform: rotate(90deg); }
+
+  .panel-body-wrapper {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height var(--cc-motion-normal) var(--cc-ease);
+  }
+  .acc-toggle:checked ~ .panel-body-wrapper { max-height: 2000px; }
+
+  .panel-body {
+    border-top: 1px solid var(--cc-color-border);
+  }
+  .sec-empty { padding: 12px 16px; font-size: .75rem; opacity: .45; font-style: italic; }
+
+  /* Nested mini-accordion for each MCP server, inside the MCP panel body */
+  .mcp-group { border-bottom: 1px solid var(--cc-color-border); }
+  .mcp-group:last-child { border-bottom: none; }
+  .mcp-group-heading {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 16px 6px 20px;
+    font-size: .6875rem; font-weight: 600;
+    cursor: pointer;
+    user-select: none;
+    background: var(--cc-color-background);
+  }
+  .mcp-group-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .mcp-group-meta { font-size: .625rem; font-weight: 400; opacity: .6; white-space: nowrap; }
+  .mcp-group-body-wrapper {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height var(--cc-motion-normal) var(--cc-ease);
+  }
+  .acc-toggle:checked ~ .mcp-group-body-wrapper { max-height: 1000px; }
+
+  /* Dep row */
+  .dep-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--cc-color-border);
+  }
+  .dep-row:last-child { border-bottom: none; }
+  .dep-row.in-group { padding-left: 28px; }
+
+  .dep-accent { width: 3px; align-self: stretch; border-radius: 999px; flex-shrink: 0; }
+  .acc-llm  { background: var(--cc-vis-7); }
+  .acc-tool-mcp { background: var(--cc-vis-8); }
+  .acc-tool-direct { background: var(--cc-vis-0); }
+  .acc-skill{ background: var(--cc-vis-3); }
+  .acc-other{ background: var(--cc-color-border); }
+
+  .dep-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+  .dep-name {
+    font-size: .8125rem; font-weight: 500;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.3;
+  }
+  .bar-track { height: 4px; background: var(--cc-color-background); border-radius: 999px; overflow: hidden; }
+  .bar-fill  { height: 100%; border-radius: 999px; min-width: 4px; }
+  .bf-llm  { background: var(--cc-vis-7); }
+  .bf-tool-mcp { background: var(--cc-vis-8); }
+  .bf-tool-direct { background: var(--cc-vis-0); }
+  .bf-skill{ background: var(--cc-vis-3); }
+  .bf-other{ background: var(--cc-color-border); }
+
+  .dep-meta { flex-shrink: 0; text-align: right; display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
+  .dep-count { font-size: .9375rem; font-weight: 700; line-height: 1; }
+  .dep-calls-label { font-size: .6rem; opacity: .5; text-transform: uppercase; letter-spacing: .04em; }
+  .dep-tokens { font-size: .625rem; opacity: .55; white-space: nowrap; }
+
+  .dep-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--cc-color-background);
+    border: 1px solid var(--cc-color-border);
+    font-size: .6rem;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+    opacity: .9;
+    white-space: nowrap;
+  }
+  .badge-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  .bd-mcp { background: var(--cc-vis-8); }
+  .bd-direct { background: var(--cc-vis-0); }
+
+  .dep-rate {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: .6875rem; font-weight: 600;
+    white-space: nowrap;
+  }
+  .dep-rate-sub { font-size: .6rem; opacity: .5; font-weight: 400; }
+  .rate-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+  .rate-ok   .rate-dot { background: #2e9e5b; }
+  .rate-ok   { color: #2e9e5b; }
+  .rate-warn .rate-dot { background: #d8912b; }
+  .rate-warn { color: #d8912b; }
+  .rate-bad  .rate-dot { background: #d1453b; }
+  .rate-bad  { color: #d1453b; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; font-size: .75rem; opacity: .75; }
+  .leg-item { display: inline-flex; align-items: center; gap: 6px; }
+  .leg-dot  { width: 10px; height: 10px; border-radius: 50%; }
+</style>
+
+{% assign service_name = "gemini-demo-agent" %}
+
+{% assign llm_rows        = "" | split: "" %}
+{% assign tool_mcp_rows   = "" | split: "" %}
+{% assign tool_direct_rows= "" | split: "" %}
+{% assign skill_rows      = "" | split: "" %}
+{% assign other_rows      = "" | split: "" %}
+{% assign total_calls = 0 %}
+{% assign max_calls   = 1 %}
+
+{% for row in rows %}
+  {% assign cnt = row["call_count"].value | plus: 0 %}
+  {% assign total_calls = total_calls | plus: cnt %}
+  {% if cnt > max_calls %}{% assign max_calls = cnt %}{% endif %}
+
+  {% assign dep  = row["dependency"].value %}
+  {% assign dep6 = dep | slice: 0, 6 %}
+
+  {% if dep6 == "skill." %}
+    {% assign skill_rows = skill_rows | push: row %}
+  {% elsif row["kind"].value == "LLM model provider" %}
+    {% assign llm_rows = llm_rows | push: row %}
+  {% elsif row["kind"].value == "Tools (via MCP)" %}
+    {% assign tool_mcp_rows = tool_mcp_rows | push: row %}
+  {% elsif row["kind"].value == "Tools (direct)" %}
+    {% assign tool_direct_rows = tool_direct_rows | push: row %}
+  {% else %}
+    {% assign other_rows = other_rows | push: row %}
+  {% endif %}
+{% endfor %}
+
+{% assign llm_calls = 0 %}{% assign llm_success = 0 %}{% assign llm_in_tok = 0 %}{% assign llm_out_tok = 0 %}
+{% for row in llm_rows %}
+  {% assign llm_calls = llm_calls | plus: row["call_count"].value %}
+  {% assign llm_success = llm_success | plus: row["success_count"].value %}
+  {% assign llm_in_tok = llm_in_tok | plus: row["in_tokens"].value %}
+  {% assign llm_out_tok = llm_out_tok | plus: row["out_tokens"].value %}
+{% endfor %}
+{% assign llm_rate = 0 %}
+{% if llm_calls > 0 %}{% assign llm_rate = llm_success | times: 100.0 | divided_by: llm_calls | round: 1 %}{% endif %}
+{% assign llm_rate_class = "rate-bad" %}
+{% if llm_rate >= 95 %}{% assign llm_rate_class = "rate-ok" %}{% elsif llm_rate >= 80 %}{% assign llm_rate_class = "rate-warn" %}{% endif %}
+
+{% assign mcp_calls = 0 %}{% assign mcp_success = 0 %}
+{% for row in tool_mcp_rows %}
+  {% assign mcp_calls = mcp_calls | plus: row["call_count"].value %}
+  {% assign mcp_success = mcp_success | plus: row["success_count"].value %}
+{% endfor %}
+{% assign mcp_rate = 0 %}
+{% if mcp_calls > 0 %}{% assign mcp_rate = mcp_success | times: 100.0 | divided_by: mcp_calls | round: 1 %}{% endif %}
+{% assign mcp_rate_class = "rate-bad" %}
+{% if mcp_rate >= 95 %}{% assign mcp_rate_class = "rate-ok" %}{% elsif mcp_rate >= 80 %}{% assign mcp_rate_class = "rate-warn" %}{% endif %}
+
+{% assign direct_calls = 0 %}{% assign direct_success = 0 %}
+{% for row in tool_direct_rows %}
+  {% assign direct_calls = direct_calls | plus: row["call_count"].value %}
+  {% assign direct_success = direct_success | plus: row["success_count"].value %}
+{% endfor %}
+{% assign direct_rate = 0 %}
+{% if direct_calls > 0 %}{% assign direct_rate = direct_success | times: 100.0 | divided_by: direct_calls | round: 1 %}{% endif %}
+{% assign direct_rate_class = "rate-bad" %}
+{% if direct_rate >= 95 %}{% assign direct_rate_class = "rate-ok" %}{% elsif direct_rate >= 80 %}{% assign direct_rate_class = "rate-warn" %}{% endif %}
+
+{% assign skill_calls = 0 %}{% assign skill_success = 0 %}
+{% for row in skill_rows %}
+  {% assign skill_calls = skill_calls | plus: row["call_count"].value %}
+  {% assign skill_success = skill_success | plus: row["success_count"].value %}
+{% endfor %}
+{% assign skill_rate = 0 %}
+{% if skill_calls > 0 %}{% assign skill_rate = skill_success | times: 100.0 | divided_by: skill_calls | round: 1 %}{% endif %}
+{% assign skill_rate_class = "rate-bad" %}
+{% if skill_rate >= 95 %}{% assign skill_rate_class = "rate-ok" %}{% elsif skill_rate >= 80 %}{% assign skill_rate_class = "rate-warn" %}{% endif %}
+
+{% assign other_calls = 0 %}{% assign other_success = 0 %}
+{% for row in other_rows %}
+  {% assign other_calls = other_calls | plus: row["call_count"].value %}
+  {% assign other_success = other_success | plus: row["success_count"].value %}
+{% endfor %}
+{% assign other_rate = 0 %}
+{% if other_calls > 0 %}{% assign other_rate = other_success | times: 100.0 | divided_by: other_calls | round: 1 %}{% endif %}
+{% assign other_rate_class = "rate-bad" %}
+{% if other_rate >= 95 %}{% assign other_rate_class = "rate-ok" %}{% elsif other_rate >= 80 %}{% assign other_rate_class = "rate-warn" %}{% endif %}
+
+<div class="wrap">
+
+  <div class="pg-hdr">
+    <h2>Chatbot dependencies</h2>
+    <p>MCP tools are invoked via Model Context Protocol; Direct tools are called by the agent runtime.</p>
+    <p>
+      {{ service_name }}
+      {% if _tstart and _tend %}&nbsp;•&nbsp;{{ _tstart }} – {{ _tend }}{% endif %}
+    </p>
+  </div>
+
+  {% if rows.size == 0 %}
+
+    <div class="empty">No chatbot dependencies found in this time range.</div>
+
+  {% else %}
+
+    <div class="diag">
+
+      <div class="chatbot-card">
+        <div class="chatbot-icon" aria-hidden="true">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="3" y="4" width="18" height="14" rx="4"
+                  stroke="currentColor" stroke-width="1.5"/>
+            <path d="M8 9h8M8 13h5" stroke="currentColor"
+                  stroke-width="1.5" stroke-linecap="round"/>
+            <path d="M9 18v2M15 18v2" stroke="currentColor"
+                  stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <div class="chatbot-name">{{ service_name }}</div>
+        <span class="chatbot-chip">Chatbot</span>
+        <div class="chatbot-stat">{{ total_calls }} total calls</div>
+      </div>
+
+      <div class="arrow-conn" aria-hidden="true">
+        <div class="arrow-line"></div>
+      </div>
+
+      <div class="deps-panel">
+
+        <!-- LLM Provider — broken down by actual model, with token usage -->
+        {% if llm_rows.size > 0 %}
+        <div class="panel">
+          <input type="checkbox" id="acc-llm" class="acc-toggle" checked />
+          <label for="acc-llm" class="panel-heading">
+            <span class="sec-dot dot-llm"></span>
+            <span class="sec-label">LLM Provider</span>
+            <span class="sec-meta">
+              {% if llm_calls > 0 %}
+                {{ llm_rows.size }} models · {{ llm_calls }} calls · {{ llm_in_tok }} in / {{ llm_out_tok }} out tok ·
+                <span class="{{ llm_rate_class }}">{{ llm_rate }}% success</span>
+              {% else %}
+                <span class="sec-meta-empty">not used</span>
+              {% endif %}
+            </span>
+            <span class="chevron">▸</span>
+          </label>
+          <div class="panel-body-wrapper">
+            <div class="panel-body">
+              {% for row in llm_rows %}
+                {% assign bar_w = row["call_count"].value | plus: 0 | times: 100 | divided_by: max_calls %}
+                {% assign rate = row["success_rate"].value | plus: 0.0 %}
+                {% assign rate_class = "rate-bad" %}
+                {% if rate >= 95 %}{% assign rate_class = "rate-ok" %}{% elsif rate >= 80 %}{% assign rate_class = "rate-warn" %}{% endif %}
+                <div class="dep-row">
+                  <div class="dep-accent acc-llm"></div>
+                  <div class="dep-main">
+                    <div class="dep-name">{{ row["llm_model"].value }}</div>
+                    <div class="bar-track">
+                      <div class="bar-fill bf-llm" style="width:{{ bar_w }}%"></div>
+                    </div>
+                  </div>
+                  <div class="dep-meta">
+                    <div class="dep-count">{{ row["call_count"].value }}</div>
+                    <div class="dep-calls-label">calls</div>
+                    <div class="dep-tokens">{{ row["in_tokens"].value }} in · {{ row["out_tokens"].value }} out</div>
+                    <div class="dep-rate {{ rate_class }}">
+                      <span class="rate-dot"></span>{{ row["success_rate"].value }}%
+                      <span class="dep-rate-sub">({{ row["success_count"].value }}/{{ row["call_count"].value }})</span>
+                    </div>
+                  </div>
+                </div>
+              {% endfor %}
+            </div>
+          </div>
+        </div>
+        {% endif %}
+
+        <!-- Tools (via MCP) — nested accordion per server -->
+        <div class="panel">
+          <input type="checkbox" id="acc-mcp" class="acc-toggle" checked />
+          <label for="acc-mcp" class="panel-heading">
+            <span class="sec-dot dot-tool-mcp"></span>
+            <span class="sec-label">Tools (via MCP)</span>
+            <span class="sec-meta">
+              {% if mcp_calls > 0 %}
+                {{ tool_mcp_rows.size }} deps · {{ mcp_calls }} calls ·
+                <span class="{{ mcp_rate_class }}">{{ mcp_rate }}% success</span>
+              {% else %}
+                <span class="sec-meta-empty">not used</span>
+              {% endif %}
+            </span>
+            <span class="chevron">▸</span>
+          </label>
+          <div class="panel-body-wrapper">
+            <div class="panel-body">
+              {% if tool_mcp_rows.size > 0 %}
+                {% assign mcp_server_names = "" | split: "" %}
+                {% for row in tool_mcp_rows %}
+                  {% assign srv = row["mcp_server"].value %}
+                  {% unless mcp_server_names contains srv %}
+                    {% assign mcp_server_names = mcp_server_names | push: srv %}
+                  {% endunless %}
+                {% endfor %}
+
+                {% for srv in mcp_server_names %}
+                  {% assign group_calls = 0 %}
+                  {% assign group_success = 0 %}
+                  {% assign group_tool_count = 0 %}
+                  {% for row in tool_mcp_rows %}
+                    {% if row["mcp_server"].value == srv %}
+                      {% assign group_calls = group_calls | plus: row["call_count"].value %}
+                      {% assign group_success = group_success | plus: row["success_count"].value %}
+                      {% assign group_tool_count = group_tool_count | plus: 1 %}
+                    {% endif %}
+                  {% endfor %}
+                  {% assign group_rate = 0 %}
+                  {% if group_calls > 0 %}{% assign group_rate = group_success | times: 100.0 | divided_by: group_calls | round: 1 %}{% endif %}
+                  {% assign group_rate_class = "rate-bad" %}
+                  {% if group_rate >= 95 %}{% assign group_rate_class = "rate-ok" %}{% elsif group_rate >= 80 %}{% assign group_rate_class = "rate-warn" %}{% endif %}
+
+                  <div class="mcp-group">
+                    <input type="checkbox" id="acc-mcp-srv-{{ forloop.index }}" class="acc-toggle" />
+                    <label for="acc-mcp-srv-{{ forloop.index }}" class="mcp-group-heading">
+                      <span class="badge-dot bd-mcp"></span>
+                      <span class="mcp-group-name">{{ srv }}</span>
+                      <span class="mcp-group-meta">
+                        {% if group_calls > 0 %}
+                          {{ group_tool_count }} tools · {{ group_calls }} calls ·
+                          <span class="{{ group_rate_class }}">{{ group_rate }}% success</span>
+                        {% else %}
+                          <span class="sec-meta-empty">not used</span>
+                        {% endif %}
+                      </span>
+                      <span class="chevron">▸</span>
+                    </label>
+                    <div class="mcp-group-body-wrapper">
+                      {% for row in tool_mcp_rows %}
+                        {% if row["mcp_server"].value == srv %}
+                          {% assign bar_w = row["call_count"].value | plus: 0 | times: 100 | divided_by: max_calls %}
+                          {% assign rate = row["success_rate"].value | plus: 0.0 %}
+                          {% assign rate_class = "rate-bad" %}
+                          {% if rate >= 95 %}{% assign rate_class = "rate-ok" %}{% elsif rate >= 80 %}{% assign rate_class = "rate-warn" %}{% endif %}
+                          <div class="dep-row in-group">
+                            <div class="dep-accent acc-tool-mcp"></div>
+                            <div class="dep-main">
+                              <div class="dep-name">{{ row["dependency"].value }}</div>
+                              <div class="bar-track">
+                                <div class="bar-fill bf-tool-mcp" style="width:{{ bar_w }}%"></div>
+                              </div>
+                            </div>
+                            <div class="dep-meta">
+                              <div class="dep-count">{{ row["call_count"].value }}</div>
+                              <div class="dep-calls-label">calls</div>
+                              <div class="dep-rate {{ rate_class }}">
+                                <span class="rate-dot"></span>{{ row["success_rate"].value }}%
+                                <span class="dep-rate-sub">({{ row["success_count"].value }}/{{ row["call_count"].value }})</span>
+                              </div>
+                            </div>
+                          </div>
+                        {% endif %}
+                      {% endfor %}
+                    </div>
+                  </div>
+                {% endfor %}
+              {% else %}
+                <div class="sec-empty">No calls detected.</div>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+
+        <!-- Tools (direct) -->
+        <div class="panel">
+          <input type="checkbox" id="acc-direct" class="acc-toggle" checked />
+          <label for="acc-direct" class="panel-heading">
+            <span class="sec-dot dot-tool-direct"></span>
+            <span class="sec-label">Tools (direct)</span>
+            <span class="sec-meta">
+              {% if direct_calls > 0 %}
+                {{ tool_direct_rows.size }} deps · {{ direct_calls }} calls ·
+                <span class="{{ direct_rate_class }}">{{ direct_rate }}% success</span>
+              {% else %}
+                <span class="sec-meta-empty">not used</span>
+              {% endif %}
+            </span>
+            <span class="chevron">▸</span>
+          </label>
+          <div class="panel-body-wrapper">
+            <div class="panel-body">
+              {% if tool_direct_rows.size > 0 %}
+                {% for row in tool_direct_rows %}
+                  {% assign bar_w = row["call_count"].value | plus: 0 | times: 100 | divided_by: max_calls %}
+                  {% assign rate = row["success_rate"].value | plus: 0.0 %}
+                  {% assign rate_class = "rate-bad" %}
+                  {% if rate >= 95 %}{% assign rate_class = "rate-ok" %}{% elsif rate >= 80 %}{% assign rate_class = "rate-warn" %}{% endif %}
+                  <div class="dep-row">
+                    <div class="dep-accent acc-tool-direct"></div>
+                    <div class="dep-main">
+                      <div class="dep-name">{{ row["dependency"].value }}</div>
+                      <div class="bar-track">
+                        <div class="bar-fill bf-tool-direct" style="width:{{ bar_w }}%"></div>
+                      </div>
+                    </div>
+                    <div class="dep-meta">
+                      <div class="dep-badge"><span class="badge-dot bd-direct"></span>Direct</div>
+                      <div class="dep-count">{{ row["call_count"].value }}</div>
+                      <div class="dep-calls-label">calls</div>
+                      <div class="dep-rate {{ rate_class }}">
+                        <span class="rate-dot"></span>{{ row["success_rate"].value }}%
+                        <span class="dep-rate-sub">({{ row["success_count"].value }}/{{ row["call_count"].value }})</span>
+                      </div>
+                    </div>
+                  </div>
+                {% endfor %}
+              {% else %}
+                <div class="sec-empty">No calls detected.</div>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+
+        <!-- Skills -->
+        <div class="panel">
+          <input type="checkbox" id="acc-skills" class="acc-toggle" />
+          <label for="acc-skills" class="panel-heading">
+            <span class="sec-dot dot-skill"></span>
+            <span class="sec-label">Skills</span>
+            <span class="sec-meta">
+              {% if skill_calls > 0 %}
+                {{ skill_rows.size }} deps · {{ skill_calls }} calls ·
+                <span class="{{ skill_rate_class }}">{{ skill_rate }}% success</span>
+              {% else %}
+                <span class="sec-meta-empty">not used</span>
+              {% endif %}
+            </span>
+            <span class="chevron">▸</span>
+          </label>
+          <div class="panel-body-wrapper">
+            <div class="panel-body">
+              {% if skill_rows.size > 0 %}
+                {% for row in skill_rows %}
+                  {% assign bar_w = row["call_count"].value | plus: 0 | times: 100 | divided_by: max_calls %}
+                  {% assign rate = row["success_rate"].value | plus: 0.0 %}
+                  {% assign rate_class = "rate-bad" %}
+                  {% if rate >= 95 %}{% assign rate_class = "rate-ok" %}{% elsif rate >= 80 %}{% assign rate_class = "rate-warn" %}{% endif %}
+                  <div class="dep-row">
+                    <div class="dep-accent acc-skill"></div>
+                    <div class="dep-main">
+                      <div class="dep-name">{{ row["dependency"].value }}</div>
+                      <div class="bar-track">
+                        <div class="bar-fill bf-skill" style="width:{{ bar_w }}%"></div>
+                      </div>
+                    </div>
+                    <div class="dep-meta">
+                      <div class="dep-count">{{ row["call_count"].value }}</div>
+                      <div class="dep-calls-label">calls</div>
+                      <div class="dep-rate {{ rate_class }}">
+                        <span class="rate-dot"></span>{{ row["success_rate"].value }}%
+                        <span class="dep-rate-sub">({{ row["success_count"].value }}/{{ row["call_count"].value }})</span>
+                      </div>
+                    </div>
+                  </div>
+                {% endfor %}
+              {% else %}
+                <div class="sec-empty">No skills detected in this time range.</div>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+
+        <!-- Other -->
+        {% if other_rows.size > 0 %}
+        <div class="panel">
+          <input type="checkbox" id="acc-other" class="acc-toggle" />
+          <label for="acc-other" class="panel-heading">
+            <span class="sec-dot dot-other"></span>
+            <span class="sec-label">Other</span>
+            <span class="sec-meta">
+              {% if other_calls > 0 %}
+                {{ other_rows.size }} deps · {{ other_calls }} calls ·
+                <span class="{{ other_rate_class }}">{{ other_rate }}% success</span>
+              {% else %}
+                <span class="sec-meta-empty">not used</span>
+              {% endif %}
+            </span>
+            <span class="chevron">▸</span>
+          </label>
+          <div class="panel-body-wrapper">
+            <div class="panel-body">
+              {% for row in other_rows %}
+                {% assign bar_w = row["call_count"].value | plus: 0 | times: 100 | divided_by: max_calls %}
+                {% assign rate = row["success_rate"].value | plus: 0.0 %}
+                {% assign rate_class = "rate-bad" %}
+                {% if rate >= 95 %}{% assign rate_class = "rate-ok" %}{% elsif rate >= 80 %}{% assign rate_class = "rate-warn" %}{% endif %}
+                <div class="dep-row">
+                  <div class="dep-accent acc-other"></div>
+                  <div class="dep-main">
+                    <div class="dep-name">{{ row["dependency"].value }}</div>
+                    <div class="bar-track">
+                      <div class="bar-fill bf-other" style="width:{{ bar_w }}%"></div>
+                    </div>
+                  </div>
+                  <div class="dep-meta">
+                    <div class="dep-count">{{ row["call_count"].value }}</div>
+                    <div class="dep-calls-label">calls</div>
+                    <div class="dep-rate {{ rate_class }}">
+                      <span class="rate-dot"></span>{{ row["success_rate"].value }}%
+                      <span class="dep-rate-sub">({{ row["success_count"].value }}/{{ row["call_count"].value }})</span>
+                    </div>
+                  </div>
+                </div>
+              {% endfor %}
+            </div>
+          </div>
+        </div>
+        {% endif %}
+
+      </div>
+    </div>
+
+    <div class="legend">
+      {% if llm_rows.size > 0 %}<span class="leg-item"><span class="leg-dot dot-llm"></span> LLM Provider</span>{% endif %}
+      <span class="leg-item"><span class="leg-dot dot-tool-mcp"></span> Tools (via MCP)</span>
+      <span class="leg-item"><span class="leg-dot dot-tool-direct"></span> Tools (direct)</span>
+      <span class="leg-item"><span class="leg-dot dot-skill"></span> Skills</span>
+      {% if other_rows.size > 0 %}<span class="leg-item"><span class="leg-dot dot-other"></span> Other</span>{% endif %}
+      <span class="leg-item"><span class="rate-dot" style="background:#2e9e5b"></span> ≥95% success</span>
+      <span class="leg-item"><span class="rate-dot" style="background:#d8912b"></span> ≥80%</span>
+      <span class="leg-item"><span class="rate-dot" style="background:#d1453b"></span> &lt;80%</span>
+    </div>
+
+  {% endif %}
+</div>

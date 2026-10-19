@@ -1,16 +1,18 @@
-# docker-compose.yml — Gemini AI Agent + OTel Collector
+# docker-compose.yml — Gemini AI Agent + MCP Tools Server + OTel Collector
 #
 # Usage:
 #   cp .env.example .env          # fill in your keys
 #   docker compose up --build
 #
 # What runs:
-#   gemini-agent   — Python web server (chat UI at http://localhost:5601)
-#   otel-collector — Collects real container CPU/memory/net/logs → Elastic
+#   gemini-agent     — Python web server (chat UI at http://localhost:5601), MCP client
+#   mcp-tools-server — Standalone MCP server (Streamable HTTP) at http://localhost:5603/mcp
+#   otel-collector   — Collects real container CPU/memory/net/logs → Elastic
 #
 # After startup, open:
 #   Chat UI:  http://localhost:5601
 #   APM:      https://<kb>.kb.<region>.elastic.cloud/app/apm/services/gemini-demo-agent
+#             (Service Map will also show mcp-tools-server, connected via MCP)
 
 services:
 
@@ -19,25 +21,64 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: gemini-demo-agent
+    container_name: "${SVC_NAME:-gemini-demo-agent}"
     ports:
-      - "5601:5601"
+      - "${PORT:-5601}:${PORT:-5601}"
     environment:
-      GEMINI_API_KEY:  "${GEMINI_API_KEY}"
-      ES_ENDPOINT:     "${ES_ENDPOINT}"
-      ES_API_KEY:      "${ES_API_KEY}"
-      GEMINI_MODEL:    "${GEMINI_MODEL:-gemini-2.5-flash}"
-      TRANSPORT:       "${TRANSPORT:-bulk}"
-      PORT:            "5601"
+      GEMINI_API_KEY:     "${GEMINI_API_KEY}"
+      ES_ENDPOINT:        "${ES_ENDPOINT}"
+      ES_API_KEY:         "${ES_API_KEY}"
+      GEMINI_MODEL_POOL:  "${GEMINI_MODEL_POOL:-gemini-3-flash-preview,gemini-3.1-flash-lite}"
+      SVC_NAME:           "${SVC_NAME:-gemini-demo-agent}"
+      PORT:               "${PORT:-5601}"
+      # Docker's internal DNS — reaches the mcp-tools-server service below
+      MCP_SERVER_URL:     "http://mcp-tools-server:${MCP_PORT:-5603}/mcp"
     labels:
       # These labels help the OTel Collector identify this container
-      app: "gemini-demo-agent"
-      service.name: "gemini-demo-agent"
+      app: "${SVC_NAME:-gemini-demo-agent}"
+      service.name: "${SVC_NAME:-gemini-demo-agent}"
+      deployment.environment: "demo"
+    restart: unless-stopped
+    depends_on:
+      mcp-tools-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-5601}/api/config')"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── MCP tools server ─────────────────────────────────────────────────────────
+  # Standalone MCP server (Streamable HTTP) serving get_stock_price /
+  # get_company_news / get_analyst_rating. Own OTel service, same Elastic backend
+  # as gemini-agent — the APM Service Map will show both connected via the
+  # propagated trace context.
+  mcp-tools-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    container_name: "${MCP_SVC_NAME:-mcp-tools-server}"
+    ports:
+      - "${MCP_PORT:-5603}:${MCP_PORT:-5603}"
+    environment:
+      ES_ENDPOINT:   "${ES_ENDPOINT}"
+      ES_API_KEY:    "${ES_API_KEY}"
+      MCP_PORT:      "${MCP_PORT:-5603}"
+      MCP_SVC_NAME:  "${MCP_SVC_NAME:-mcp-tools-server}"
+    labels:
+      app: "${MCP_SVC_NAME:-mcp-tools-server}"
+      service.name: "${MCP_SVC_NAME:-mcp-tools-server}"
       deployment.environment: "demo"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python3", "-c",
-             "import urllib.request; urllib.request.urlopen('http://localhost:5601/api/config')"]
+             "import urllib.request; urllib.request.urlopen('http://localhost:${MCP_PORT:-5603}/health')"]
       interval: 15s
       timeout: 5s
       start_period: 10s

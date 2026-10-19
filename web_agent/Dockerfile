@@ -7,7 +7,8 @@ RUN pip install --no-cache-dir \
     google-genai \
     opentelemetry-sdk \
     opentelemetry-exporter-otlp-proto-http \
-    psutil
+    psutil \
+    httpx
 
 # Copy the server
 COPY server.py .

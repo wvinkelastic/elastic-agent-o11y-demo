@@ -4,6 +4,10 @@
 *.env.local
 *.env.production
 
+# Claude Code session/local settings — can contain command history with
+# secrets pasted mid-session; never committed.
+.claude/
+
 # Python
 __pycache__/
 *.py[cod]
