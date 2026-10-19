@@ -49,9 +49,14 @@ from opentelemetry.metrics import Observation
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-GEMINI_KEY  = os.environ["GEMINI_API_KEY"]
-ES_ENDPOINT = os.environ["ES_ENDPOINT"]
-ES_API_KEY  = os.environ["ES_API_KEY"]
+GEMINI_KEY       = os.environ["GEMINI_API_KEY"]
+OTEL_ENDPOINT    = os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"]
+ES_API_KEY       = os.environ["ES_API_KEY"]
+KB_ENDPOINT      = os.environ.get("KIBANA_ENDPOINT", "")  # optional — only used for "open in Kibana" links
+
+def _apm_url(path: str) -> str | None:
+    """Build a Kibana APM deep link, or None if KIBANA_ENDPOINT wasn't set."""
+    return f"{KB_ENDPOINT}{path}" if KB_ENDPOINT else None
 
 # Round-robin model pool — each new session gets the next model in order
 # (not random A/B weighting). Verified live against the Gemini API before use.
@@ -71,15 +76,13 @@ HOST_NAME = os.environ.get("HOST_NAME", socket.gethostname())
 PORT      = int(os.environ.get("PORT", "5601"))
 METRICS_INTERVAL_S = int(os.environ.get("METRICS_INTERVAL", "30"))
 
-# OTLP endpoints — full paths required (base URL causes silent 404)
-_INGEST         = ES_ENDPOINT.replace(".es.", ".ingest.")
-_APM            = ES_ENDPOINT.replace(".es.", ".apm.")
-OTLP_TRACES_EP  = f"{_INGEST}/v1/traces"
-OTLP_METRICS_EP = f"{_INGEST}/v1/metrics"
-OTLP_LOGS_EP    = f"{_APM}/v1/logs"
+# OTLP endpoints — Elastic's own managed OTLP endpoint (OTEL_EXPORTER_OTLP_ENDPOINT),
+# not guessed by string-substituting the Elasticsearch endpoint. Full paths
+# required (the base URL alone causes a silent 404).
+OTLP_TRACES_EP  = f"{OTEL_ENDPOINT}/v1/traces"
+OTLP_METRICS_EP = f"{OTEL_ENDPOINT}/v1/metrics"
+OTLP_LOGS_EP    = f"{OTEL_ENDPOINT}/v1/logs"
 OTLP_HEADERS    = {"Authorization": f"ApiKey {ES_API_KEY}"}
-OTLP_ENDPOINT   = _INGEST   # display only
-KB_ENDPOINT     = ES_ENDPOINT.replace(".es.", ".kb.")
 
 # MCP server (mcp_server.py) — get_stock_price / get_company_news / get_analyst_rating
 # run there instead of in-process, reached over real MCP JSON-RPC (Streamable HTTP).
@@ -842,8 +845,8 @@ def chat_turn(user_message: str, conversation_id: str, history: list,
         "tool_calls":  tool_calls_made,
         "pii_detected": bool(pii_types),
         "transport":   "otlp",
-        "apm_url":     (f"{KB_ENDPOINT}/app/apm/services/{SVC_NAME}/transactions/view"
-                        f"?transactionName=invoke_agent%20{SVC_NAME}&transactionType=unknown"),
+        "apm_url":     _apm_url(f"/app/apm/services/{SVC_NAME}/transactions/view"
+                                f"?transactionName=invoke_agent%20{SVC_NAME}&transactionType=unknown"),
     }
 
 
@@ -1168,7 +1171,8 @@ fetch('/api/config').then(r=>r.json()).then(c=>{
     const cls = KV_CLASSES[i % KV_CLASSES.length];
     return `<div class="kv"><span>${letter}</span><span class="${cls}">${m}</span></div>`;
   }).join('');
-  $('apm-link').href = c.apm_url;
+  if (c.apm_url) { $('apm-link').href = c.apm_url; }
+  else { $('apm-link').style.display = 'none'; }  // no KIBANA_ENDPOINT configured
   $('psutil-dot').className = 'dot-s ' + (c.psutil ? 'ok' : 'dim');
 });
 
@@ -1345,8 +1349,8 @@ class Handler(BaseHTTPRequestHandler):
                 "host":             HOST_NAME,
                 "metrics_interval": METRICS_INTERVAL_S,
                 "psutil":           _PSUTIL,
-                "otlp_endpoint":    OTLP_ENDPOINT,
-                "apm_url":          f"{KB_ENDPOINT}/app/apm/services/{SVC_NAME}/overview",
+                "otlp_endpoint":    OTEL_ENDPOINT,
+                "apm_url":          _apm_url(f"/app/apm/services/{SVC_NAME}/overview"),
             })
         body = HTML.encode()
         self.send_response(200)
@@ -1415,13 +1419,16 @@ def main():
     print(f"  Elastic AI Agent — Full OTel Demo  v2.0")
     print(f"{'─'*64}")
     print(f"  Chat UI  →  http://localhost:{PORT}")
-    print(f"  APM UI   →  {KB_ENDPOINT}/app/apm/services/{SVC_NAME}/overview")
+    if KB_ENDPOINT:
+        print(f"  APM UI   →  {KB_ENDPOINT}/app/apm/services/{SVC_NAME}/overview")
+    else:
+        print(f"  APM UI   →  (set KIBANA_ENDPOINT in .env to get a clickable link)")
     print(f"  Host     :  {HOST_NAME}")
     print(f"  Models   :  round-robin across {len(MODEL_POOL)}")
     for i, m in enumerate(MODEL_POOL):
         print(f"    {chr(ord('A') + i)}: {m}")
     print(f"{'─'*64}")
-    print(f"  OTel signals → {OTLP_ENDPOINT}")
+    print(f"  OTel signals → {OTEL_ENDPOINT}")
     print(f"    📡 Traces  (+ tool spans)  → traces-generic.otel-default")
     print(f"    📋 Logs    (+ feedback)    → logs-generic.otel-default")
     print(f"    📊 Metrics (gen_ai.*, guardrails, feedback, host)")

@@ -76,12 +76,28 @@ pip install google-genai opentelemetry-sdk opentelemetry-exporter-otlp-proto-htt
 ```bash
 cd web_agent
 cp .env.example .env
-# Edit .env — add your GEMINI_API_KEY, ES_ENDPOINT, ES_API_KEY
+# Edit .env — see below for each value
 ```
 
-Get your Elastic credentials from [cloud.elastic.co](https://cloud.elastic.co):
-- **ES_ENDPOINT** — the Elasticsearch endpoint (`https://<id>.es.<region>.elastic.cloud`)
-- **ES_API_KEY** — an API key with `monitor` + indices write privileges
+**Gemini API key — set up a test environment, don't reuse someone else's key:**
+1. Go to [Google AI Studio](https://aistudio.google.com/apikey) and sign in with any Google account.
+2. Click **Create API key**. No billing is required — the free tier covers this demo
+   comfortably (rate-limited, but that's fine for a demo).
+3. Put the key in `.env` as `GEMINI_API_KEY`.
+
+Generate **your own** key for this — never reuse a key you've seen pasted in a shared
+screen recording, a chat transcript, documentation, or someone else's config file.
+Treat any key that's ever left your own secrets manager as compromised, and regenerate
+it in AI Studio if that happens.
+
+**Elastic — OTLP ingest endpoint:** this demo ships OTLP/HTTP straight to Elastic's own
+managed OTLP endpoint, **not** the raw Elasticsearch endpoint. In an Elastic Cloud
+Serverless Observability project, find these under **Project settings → Manage this
+project → Endpoints** (or the **Add data** / APM agent setup flow, which shows the exact
+OTLP endpoint alongside a matching API key):
+- **OTEL_EXPORTER_OTLP_ENDPOINT** — the project's managed OTLP endpoint
+- **ES_API_KEY** — an API key scoped for ingest (the same setup flow usually issues one)
+- **KIBANA_ENDPOINT** *(optional)* — only used to build clickable "open in APM" links
 
 ### 3. Run
 

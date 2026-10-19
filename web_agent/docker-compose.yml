@@ -11,7 +11,7 @@
 #
 # After startup, open:
 #   Chat UI:  http://localhost:5601
-#   APM:      https://<kb>.kb.<region>.elastic.cloud/app/apm/services/gemini-demo-agent
+#   APM:      <your KIBANA_ENDPOINT>/app/apm/services/gemini-demo-agent
 #             (Service Map will also show mcp-tools-server, connected via MCP)
 
 services:
@@ -25,14 +25,15 @@ services:
     ports:
       - "${PORT:-5601}:${PORT:-5601}"
     environment:
-      GEMINI_API_KEY:     "${GEMINI_API_KEY}"
-      ES_ENDPOINT:        "${ES_ENDPOINT}"
-      ES_API_KEY:         "${ES_API_KEY}"
-      GEMINI_MODEL_POOL:  "${GEMINI_MODEL_POOL:-gemini-3-flash-preview,gemini-3.1-flash-lite}"
-      SVC_NAME:           "${SVC_NAME:-gemini-demo-agent}"
-      PORT:               "${PORT:-5601}"
+      GEMINI_API_KEY:              "${GEMINI_API_KEY}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT}"
+      ES_API_KEY:                  "${ES_API_KEY}"
+      KIBANA_ENDPOINT:             "${KIBANA_ENDPOINT:-}"
+      GEMINI_MODEL_POOL:           "${GEMINI_MODEL_POOL:-gemini-3-flash-preview,gemini-3.1-flash-lite}"
+      SVC_NAME:                    "${SVC_NAME:-gemini-demo-agent}"
+      PORT:                        "${PORT:-5601}"
       # Docker's internal DNS — reaches the mcp-tools-server service below
-      MCP_SERVER_URL:     "http://mcp-tools-server:${MCP_PORT:-5603}/mcp"
+      MCP_SERVER_URL:              "http://mcp-tools-server:${MCP_PORT:-5603}/mcp"
     labels:
       # These labels help the OTel Collector identify this container
       app: "${SVC_NAME:-gemini-demo-agent}"
@@ -67,10 +68,11 @@ services:
     ports:
       - "${MCP_PORT:-5603}:${MCP_PORT:-5603}"
     environment:
-      ES_ENDPOINT:   "${ES_ENDPOINT}"
-      ES_API_KEY:    "${ES_API_KEY}"
-      MCP_PORT:      "${MCP_PORT:-5603}"
-      MCP_SVC_NAME:  "${MCP_SVC_NAME:-mcp-tools-server}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT}"
+      ES_API_KEY:                  "${ES_API_KEY}"
+      KIBANA_ENDPOINT:             "${KIBANA_ENDPOINT:-}"
+      MCP_PORT:                    "${MCP_PORT:-5603}"
+      MCP_SVC_NAME:                "${MCP_SVC_NAME:-mcp-tools-server}"
     labels:
       app: "${MCP_SVC_NAME:-mcp-tools-server}"
       service.name: "${MCP_SVC_NAME:-mcp-tools-server}"
@@ -106,7 +108,7 @@ services:
       # Use the alternative logging approach below if this mount is empty.
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
     environment:
-      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_INGEST_ENDPOINT}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT}"
       ES_API_KEY:                  "${ES_API_KEY}"
     depends_on:
       gemini-agent:

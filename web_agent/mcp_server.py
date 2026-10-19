@@ -14,10 +14,11 @@ Instrumented per the OTel MCP semantic conventions
     MCP context propagation is transport-independent, per the spec)
   - mcp.server.operation.duration histogram
 
-Exports traces/metrics/logs to the SAME Elastic backend as server.py (same ES_ENDPOINT /
-ES_API_KEY), landing in the same traces-generic.otel-default / metrics-generic.otel-default
-indices — Kibana's APM Service Map will show this as a second service connected to
-gemini-demo-agent via the propagated trace context.
+Exports traces/metrics/logs to the SAME Elastic backend as server.py (same
+OTEL_EXPORTER_OTLP_ENDPOINT / ES_API_KEY), landing in the same
+traces-generic.otel-default / metrics-generic.otel-default indices — Kibana's APM
+Service Map will show this as a second service connected to gemini-demo-agent via
+the propagated trace context.
 """
 
 import os, sys, time, json, socket, logging, random
@@ -40,8 +41,9 @@ from opentelemetry.sdk._logs import LoggingHandler
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-ES_ENDPOINT = os.environ["ES_ENDPOINT"]
-ES_API_KEY  = os.environ["ES_API_KEY"]
+OTEL_ENDPOINT = os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"]
+ES_API_KEY    = os.environ["ES_API_KEY"]
+KB_ENDPOINT   = os.environ.get("KIBANA_ENDPOINT", "")  # optional — only used for "open in Kibana" links
 
 SVC_NAME  = os.environ.get("MCP_SVC_NAME", "mcp-tools-server")
 HOST_NAME = os.environ.get("HOST_NAME", socket.gethostname())
@@ -49,14 +51,13 @@ MCP_PORT  = int(os.environ.get("MCP_PORT", "5603"))
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
 
-_INGEST         = ES_ENDPOINT.replace(".es.", ".ingest.")
-_APM            = ES_ENDPOINT.replace(".es.", ".apm.")
-OTLP_TRACES_EP  = f"{_INGEST}/v1/traces"
-OTLP_METRICS_EP = f"{_INGEST}/v1/metrics"
-OTLP_LOGS_EP    = f"{_APM}/v1/logs"
+# OTLP endpoints — Elastic's own managed OTLP endpoint (OTEL_EXPORTER_OTLP_ENDPOINT),
+# not guessed by string-substituting the Elasticsearch endpoint. Full paths
+# required (the base URL alone causes a silent 404).
+OTLP_TRACES_EP  = f"{OTEL_ENDPOINT}/v1/traces"
+OTLP_METRICS_EP = f"{OTEL_ENDPOINT}/v1/metrics"
+OTLP_LOGS_EP    = f"{OTEL_ENDPOINT}/v1/logs"
 OTLP_HEADERS    = {"Authorization": f"ApiKey {ES_API_KEY}"}
-OTLP_ENDPOINT   = _INGEST   # display only
-KB_ENDPOINT     = ES_ENDPOINT.replace(".es.", ".kb.")
 
 # ── OTel Resource — a distinct service from gemini-demo-agent, same Elastic backend ────
 
@@ -374,10 +375,13 @@ def main():
     print(f"  MCP Tools Server — get_stock_price / get_company_news / get_analyst_rating")
     print(f"{'─'*64}")
     print(f"  MCP endpoint →  http://localhost:{MCP_PORT}/mcp")
-    print(f"  APM UI       →  {KB_ENDPOINT}/app/apm/services/{SVC_NAME}/overview")
+    if KB_ENDPOINT:
+        print(f"  APM UI       →  {KB_ENDPOINT}/app/apm/services/{SVC_NAME}/overview")
+    else:
+        print(f"  APM UI       →  (set KIBANA_ENDPOINT in .env to get a clickable link)")
     print(f"  Host         :  {HOST_NAME}")
     print(f"{'─'*64}")
-    print(f"  OTel signals → {OTLP_ENDPOINT}")
+    print(f"  OTel signals → {OTEL_ENDPOINT}")
     print(f"    📡 Traces  (SERVER spans, remote-parented via params._meta)")
     print(f"    📋 Logs    → logs-generic.otel-default")
     print(f"    📊 Metrics → mcp.server.operation.duration")
