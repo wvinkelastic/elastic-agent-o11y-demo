@@ -73,10 +73,13 @@ pip install google-genai opentelemetry-sdk opentelemetry-exporter-otlp-proto-htt
 
 ### 2. Configure
 
+> All configuration for this demo lives in **`web_agent/.env`** — there is no
+> env file at the repo root. Create it from the template inside `web_agent/`:
+
 ```bash
 cd web_agent
 cp .env.example .env
-# Edit .env — see below for each value
+# Edit web_agent/.env — see below for each value
 ```
 
 **Gemini API key — set up a test environment, don't reuse someone else's key:**
@@ -236,7 +239,7 @@ web_agent/
 ├── Dockerfile.mcp     # mcp_server.py container build
 ├── docker-compose.yml # Agent + MCP tools server + OTel Collector sidecar
 ├── otel-collector.yml # Collector config (Docker stats + filelog + OTLP)
-└── .env.example       # Template — copy to .env
+└── .env.example       # The only env template in this repo — copy to web_agent/.env
 kibana/
 ├── chatbot-dependencies.esql        # Dashboard panel's ES|QL query
 ├── chatbot-dependencies-panel.html  # Dashboard panel's render template
